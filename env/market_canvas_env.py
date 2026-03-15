@@ -21,9 +21,16 @@ from env.spaces import (
     ACTION_REMOVE,
     COLOR_PALETTE,
     CONTENT_TEMPLATES,
+    DEFAULT_PIXEL_SIZE,
     NUM_ELEMENT_FEATURES,
+    OBSERVATION_MODE_PIXELS,
+    OBSERVATION_MODE_SEMANTIC,
+    OBSERVATION_MODE_SEMANTIC_PIXELS,
+    OBSERVATION_MODES,
+    ObservationMode,
     build_action_space,
     build_observation_space,
+    build_pixel_observation_space,
 )
 from rewards.accessibility import relative_luminance
 from rewards.calculator import RewardCalculator
@@ -46,17 +53,27 @@ class MarketCanvasEnv(gymnasium.Env):
         max_steps: int = 50,
         max_elements: int = 20,
         reward_weights: dict[str, float] | None = None,
+        observation_mode: ObservationMode = OBSERVATION_MODE_SEMANTIC,
+        pixel_size: tuple[int, int] = DEFAULT_PIXEL_SIZE,
     ) -> None:
         super().__init__()
 
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"Unsupported render mode: {render_mode}")
+        if observation_mode not in OBSERVATION_MODES:
+            raise ValueError(f"Unsupported observation_mode: {observation_mode}")
+
+        pixel_width, pixel_height = pixel_size
+        if pixel_width <= 0 or pixel_height <= 0:
+            raise ValueError("pixel_size must contain positive width and height")
 
         self.render_mode = render_mode
         self._canvas_width = canvas_width
         self._canvas_height = canvas_height
         self.max_steps = max_steps
         self.max_elements = max_elements
+        self.observation_mode = observation_mode
+        self.pixel_size = (int(pixel_width), int(pixel_height))
 
         self._config = CanvasConfig(
             width=canvas_width,
@@ -69,9 +86,7 @@ class MarketCanvasEnv(gymnasium.Env):
         self._reward_calc = RewardCalculator(weights=reward_weights)
         self._prompt_bank = PromptBank()
 
-        self.observation_space = build_observation_space(
-            max_elements, num_prompts=len(self._prompt_bank.PROMPTS)
-        )
+        self.observation_space = self._build_observation_space()
         self.action_space = build_action_space(
             max_elements, canvas_width=canvas_width, canvas_height=canvas_height
         )
@@ -138,6 +153,16 @@ class MarketCanvasEnv(gymnasium.Env):
         state["max_steps"] = self.max_steps
         state["spatial_relationships"] = self._build_spatial_relationships()
         return state
+
+    def get_pixels(self) -> np.ndarray:
+        """Return the training-time RGB observation for the current canvas."""
+
+        return self._renderer.render_to_array(self._canvas, size=self.pixel_size)
+
+    def get_observation(self) -> dict[str, Any] | np.ndarray:
+        """Return the current observation in the configured observation mode."""
+
+        return self._get_obs()
 
     def compute_reward(self) -> tuple[float, dict[str, Any]]:
         """Compute the reward for the current canvas state."""
@@ -251,8 +276,37 @@ class MarketCanvasEnv(gymnasium.Env):
         success = self._canvas.remove_element(element_id)
         return {"action": "remove", "success": success, "element_id": element_id}
 
-    def _get_obs(self) -> dict[str, Any]:
-        """Build a Gymnasium-compatible observation dict."""
+    def _build_observation_space(self) -> gymnasium.Space[Any]:
+        """Build the configured observation space."""
+
+        semantic_space = build_observation_space(
+            self.max_elements,
+            num_prompts=len(self._prompt_bank.PROMPTS),
+        )
+        pixel_space = build_pixel_observation_space(self.pixel_size)
+
+        if self.observation_mode == OBSERVATION_MODE_SEMANTIC:
+            return semantic_space
+        if self.observation_mode == OBSERVATION_MODE_SEMANTIC_PIXELS:
+            new_spaces = dict(semantic_space.spaces)
+            new_spaces["pixels"] = pixel_space
+            return gymnasium.spaces.Dict(new_spaces)
+        return pixel_space
+
+    def _get_obs(self) -> dict[str, Any] | np.ndarray:
+        """Build a Gymnasium-compatible observation for the configured mode."""
+
+        semantic_obs = self._get_semantic_obs()
+        if self.observation_mode == OBSERVATION_MODE_SEMANTIC:
+            return semantic_obs
+
+        pixels = self.get_pixels()
+        if self.observation_mode == OBSERVATION_MODE_SEMANTIC_PIXELS:
+            return {**semantic_obs, "pixels": pixels}
+        return pixels
+
+    def _get_semantic_obs(self) -> dict[str, Any]:
+        """Build the semantic observation dict."""
 
         elements = self._canvas.get_all_elements()
         features = np.zeros((self.max_elements, NUM_ELEMENT_FEATURES), dtype=np.float32)

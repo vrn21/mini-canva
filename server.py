@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastmcp import FastMCP
+import numpy as np
 
 from engine.types import ElementType
 from env.market_canvas_env import MarketCanvasEnv
@@ -24,6 +25,10 @@ from env.spaces import (
     ACTION_REMOVE,
     COLOR_PALETTE,
     CONTENT_TEMPLATES,
+    OBSERVATION_MODE_SEMANTIC,
+    OBSERVATION_MODE_SEMANTIC_PIXELS,
+    OBSERVATION_MODES,
+    ObservationMode,
 )
 from rewards.accessibility import relative_luminance
 
@@ -75,6 +80,52 @@ def _semantic_state(env: MarketCanvasEnv) -> dict[str, Any]:
     state["initialized"] = True
     state["session_id"] = SESSION.session_id
     return state
+
+
+def _jsonify_observation(value: Any) -> Any:
+    """Convert numpy-heavy observations into JSON-compatible Python values."""
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _jsonify_observation(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify_observation(item) for item in value]
+    return value
+
+
+def _observation_payload(env: MarketCanvasEnv) -> dict[str, Any]:
+    """Return the current configured observation in a stable MCP envelope."""
+
+    observation = env.get_observation()
+    payload: dict[str, Any] = {
+        "mode": env.observation_mode,
+        "semantic": None,
+        "pixels": None,
+        "pixel_size": list(env.pixel_size) if env.observation_mode != OBSERVATION_MODE_SEMANTIC else None,
+        "pixels_shape": None,
+        "pixels_dtype": None,
+    }
+
+    if env.observation_mode == OBSERVATION_MODE_SEMANTIC:
+        payload["semantic"] = _jsonify_observation(observation)
+        return payload
+
+    if env.observation_mode == OBSERVATION_MODE_SEMANTIC_PIXELS:
+        obs_dict = dict(observation)
+        pixels = obs_dict.pop("pixels")
+        payload["semantic"] = _jsonify_observation(obs_dict)
+    else:
+        pixels = observation
+
+    payload["pixels"] = _jsonify_observation(pixels)
+    payload["pixels_shape"] = list(pixels.shape)
+    payload["pixels_dtype"] = str(pixels.dtype)
+    return payload
 
 
 def _element_id_to_idx(env: MarketCanvasEnv, element_id: str) -> int | None:
@@ -337,6 +388,7 @@ def initialize_env(
     max_steps: int = 50,
     max_elements: int = 20,
     seed: int | None = None,
+    observation_mode: ObservationMode = OBSERVATION_MODE_SEMANTIC,
 ) -> dict[str, Any]:
     """Initialize a new MarketCanvas environment session."""
 
@@ -344,6 +396,11 @@ def initialize_env(
         if canvas_width <= 0 or canvas_height <= 0 or max_steps <= 0 or max_elements <= 0:
             raise ValueError(
                 "canvas_width, canvas_height, max_steps, and max_elements must be > 0."
+            )
+        if observation_mode not in OBSERVATION_MODES:
+            raise ValueError(
+                f"Unsupported observation_mode '{observation_mode}'. "
+                f"Expected one of {OBSERVATION_MODES}."
             )
 
         if SESSION.env is not None:
@@ -354,8 +411,9 @@ def initialize_env(
             canvas_height=canvas_height,
             max_steps=max_steps,
             max_elements=max_elements,
+            observation_mode=observation_mode,
         )
-        obs, info = env.reset(seed=seed)
+        _, info = env.reset(seed=seed)
         SESSION.env = env
         SESSION.seed = seed
         SESSION.session_id = uuid.uuid4().hex
@@ -364,7 +422,9 @@ def initialize_env(
             "status": "initialized",
             "session_id": SESSION.session_id,
             "prompt": info["prompt"],
-            "prompt_id": int(obs["prompt_id"]),
+            "prompt_id": env._current_prompt_id,
+            "observation_mode": env.observation_mode,
+            "observation": _observation_payload(env),
             "canvas_state": _semantic_state(env),
             "element_count": info["element_count"],
             "step_count": info["step_count"],
@@ -377,6 +437,15 @@ def get_canvas_state(session_id: str) -> dict[str, Any]:
 
     with SESSION.lock:
         return _semantic_state(_require_env(session_id))
+
+
+@mcp.tool
+def get_observation(session_id: str) -> dict[str, Any]:
+    """Return the current RL observation in the configured observation mode."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        return _observation_payload(env)
 
 
 @mcp.tool
@@ -432,6 +501,8 @@ def execute_action(
             reward_breakdown = current_breakdown
 
         return {
+            "observation_mode": env.observation_mode,
+            "observation": _observation_payload(env),
             "canvas_state": _semantic_state(env),
             "reward": reward,
             "current_reward": float(current_reward),

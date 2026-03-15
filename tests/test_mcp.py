@@ -56,10 +56,19 @@ def _resource_text(result: Any) -> str:
     raise AssertionError(f"Unable to extract text from resource result: {result!r}")
 
 
-async def _initialize(mcp_client, seed: int = 42) -> dict[str, Any]:
+async def _initialize(
+    mcp_client,
+    seed: int = 42,
+    observation_mode: str = "semantic",
+) -> dict[str, Any]:
     """Initialize the server and return the structured payload."""
 
-    return _tool_data(await mcp_client.call_tool("initialize_env", {"seed": seed}))
+    return _tool_data(
+        await mcp_client.call_tool(
+            "initialize_env",
+            {"seed": seed, "observation_mode": observation_mode},
+        )
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +102,7 @@ class TestServerInitialization:
         assert _tool_names(tools) == {
             "initialize_env",
             "get_canvas_state",
+            "get_observation",
             "execute_action",
             "get_current_reward",
             "save_canvas",
@@ -105,6 +115,10 @@ class TestServerInitialization:
         assert data["session_id"]
         assert data["prompt"]
         assert isinstance(data["prompt_id"], int)
+        assert data["observation_mode"] == "semantic"
+        assert data["observation"]["mode"] == "semantic"
+        assert data["observation"]["semantic"] is not None
+        assert data["observation"]["pixels"] is None
         assert data["canvas_state"]["initialized"] is True
         assert data["canvas_state"]["prompt_id"] == data["prompt_id"]
         assert data["canvas_state"]["session_id"] == data["session_id"]
@@ -133,6 +147,38 @@ class TestStateAccess:
         assert isinstance(data["prompt_id"], int)
         assert data["target_prompt"]
         assert data["session_id"] == init["session_id"]
+
+    async def test_get_observation_semantic_mode(self, mcp_client):
+        init = await _initialize(mcp_client, observation_mode="semantic")
+        result = await mcp_client.call_tool("get_observation", {"session_id": init["session_id"]})
+        data = _tool_data(result)
+
+        assert data["mode"] == "semantic"
+        assert data["semantic"] is not None
+        assert data["pixels"] is None
+
+    async def test_get_observation_semantic_plus_pixels_mode(self, mcp_client):
+        init = await _initialize(mcp_client, observation_mode="semantic+pixels")
+        result = await mcp_client.call_tool("get_observation", {"session_id": init["session_id"]})
+        data = _tool_data(result)
+
+        assert data["mode"] == "semantic+pixels"
+        assert data["semantic"] is not None
+        assert data["pixels_shape"] == [96, 128, 3]
+        assert data["pixels_dtype"] == "uint8"
+        assert len(data["pixels"]) == 96
+        assert len(data["pixels"][0]) == 128
+        assert len(data["pixels"][0][0]) == 3
+
+    async def test_get_observation_pixels_mode(self, mcp_client):
+        init = await _initialize(mcp_client, observation_mode="pixels")
+        result = await mcp_client.call_tool("get_observation", {"session_id": init["session_id"]})
+        data = _tool_data(result)
+
+        assert data["mode"] == "pixels"
+        assert data["semantic"] is None
+        assert data["pixels_shape"] == [96, 128, 3]
+        assert data["pixels_dtype"] == "uint8"
 
     async def test_canvas_state_resource_before_init_returns_initialized_false(self, mcp_client):
         result = await mcp_client.read_resource("canvas://state")
@@ -173,8 +219,26 @@ class TestExecuteAction:
         data = _tool_data(result)
 
         assert data["action_result"]["success"] is True
+        assert data["observation_mode"] == "semantic"
+        assert data["observation"]["mode"] == "semantic"
         assert data["canvas_state"]["element_count"] == 1
         assert data["canvas_state"]["elements"][0]["content"] == "Summer Sale"
+
+    async def test_execute_action_returns_pixels_when_mode_enabled(self, mcp_client):
+        init = await _initialize(mcp_client, observation_mode="semantic+pixels")
+        result = await mcp_client.call_tool(
+            "execute_action",
+            {
+                "session_id": init["session_id"],
+                "action_type": "add_text",
+                "content": "Summer Sale",
+            },
+        )
+        data = _tool_data(result)
+
+        assert data["observation_mode"] == "semantic+pixels"
+        assert data["observation"]["semantic"] is not None
+        assert data["observation"]["pixels_shape"] == [96, 128, 3]
 
     async def test_execute_action_add_shape_updates_canvas(self, mcp_client):
         init = await _initialize(mcp_client)

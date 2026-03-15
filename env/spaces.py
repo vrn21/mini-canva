@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from gymnasium import spaces
 import numpy as np
 
 NUM_ELEMENT_FEATURES = 15
+DEFAULT_PIXEL_SIZE = (128, 96)
+
+OBSERVATION_MODE_SEMANTIC = "semantic"
+OBSERVATION_MODE_SEMANTIC_PIXELS = "semantic+pixels"
+OBSERVATION_MODE_PIXELS = "pixels"
+OBSERVATION_MODES = (
+    OBSERVATION_MODE_SEMANTIC,
+    OBSERVATION_MODE_SEMANTIC_PIXELS,
+    OBSERVATION_MODE_PIXELS,
+)
+ObservationMode = Literal["semantic", "semantic+pixels", "pixels"]
 
 ACTION_ADD_TEXT = 0
 ACTION_ADD_SHAPE = 1
@@ -74,6 +87,18 @@ def build_observation_space(max_elements: int, num_prompts: int) -> spaces.Dict:
             "step_fraction": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "prompt_id": spaces.Discrete(num_prompts),
         }
+    )
+
+
+def build_pixel_observation_space(size: tuple[int, int]) -> spaces.Box:
+    """Build the pixel observation space for rollout-time RGB observations."""
+
+    width, height = size
+    return spaces.Box(
+        low=0,
+        high=255,
+        shape=(height, width, 3),
+        dtype=np.uint8,
     )
 
 

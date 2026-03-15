@@ -7,6 +7,8 @@ from typing import Any
 import gymnasium
 import numpy as np
 
+from env.spaces import DEFAULT_PIXEL_SIZE
+
 
 class DenseRewardWrapper(gymnasium.Wrapper):
     """Provides intermediate reward at every step, not just terminal."""
@@ -34,25 +36,49 @@ class DenseRewardWrapper(gymnasium.Wrapper):
 
 
 class PixelObservationWrapper(gymnasium.ObservationWrapper):
-    """Adds pixel rendering to the observation space."""
+    """Adds training-resolution pixel rendering to the observation space.
 
-    def __init__(self, env: gymnasium.Env) -> None:
+    By default this preserves the semantic observation dict and appends a
+    `pixels` key. When `include_semantic=False`, the wrapper returns only the
+    rendered RGB array for pure-vision policies.
+    """
+
+    def __init__(
+        self,
+        env: gymnasium.Env,
+        size: tuple[int, int] = DEFAULT_PIXEL_SIZE,
+        include_semantic: bool = True,
+        pixels_key: str = "pixels",
+    ) -> None:
         super().__init__(env)
-        canvas_height = self.unwrapped._canvas_height
-        canvas_width = self.unwrapped._canvas_width
+        width, height = size
+        if width <= 0 or height <= 0:
+            raise ValueError("size must contain positive width and height")
+        if include_semantic and not isinstance(self.observation_space, gymnasium.spaces.Dict):
+            raise ValueError("include_semantic=True requires a Dict observation space")
 
-        new_spaces = dict(self.observation_space.spaces)
-        new_spaces["pixels"] = gymnasium.spaces.Box(
+        self._size = (int(width), int(height))
+        self._include_semantic = include_semantic
+        self._pixels_key = pixels_key
+        pixel_space = gymnasium.spaces.Box(
             low=0,
             high=255,
-            shape=(canvas_height, canvas_width, 3),
+            shape=(height, width, 3),
             dtype=np.uint8,
         )
-        self.observation_space = gymnasium.spaces.Dict(new_spaces)
 
-    def observation(self, obs: dict) -> dict:
-        pixels = self.unwrapped._renderer.render_to_array(self.unwrapped._canvas)
-        return {**obs, "pixels": pixels}
+        if include_semantic:
+            new_spaces = dict(self.observation_space.spaces)
+            new_spaces[pixels_key] = pixel_space
+            self.observation_space = gymnasium.spaces.Dict(new_spaces)
+        else:
+            self.observation_space = pixel_space
+
+    def observation(self, obs: dict[str, Any]) -> dict[str, Any] | np.ndarray:
+        pixels = self.unwrapped._renderer.render_to_array(self.unwrapped._canvas, size=self._size)
+        if self._include_semantic:
+            return {**obs, self._pixels_key: pixels}
+        return pixels
 
 
 class FlatActionWrapper(gymnasium.ActionWrapper):

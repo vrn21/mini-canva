@@ -28,7 +28,12 @@ class CanvasRenderer:
         self._font_path = font_path
         self._font_cache: dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
-    def render(self, canvas: Canvas) -> Image.Image:
+    def render(
+        self,
+        canvas: Canvas,
+        size: tuple[int, int] | None = None,
+        resample: Image.Resampling = Image.Resampling.BILINEAR,
+    ) -> Image.Image:
         """Render the canvas state to a PIL Image.
 
         Rendering order:
@@ -48,15 +53,26 @@ class CanvasRenderer:
             elif element.type == ElementType.IMAGE:
                 self._draw_image_placeholder(draw, element)
 
+        if size is not None:
+            target_width, target_height = size
+            if target_width <= 0 or target_height <= 0:
+                raise ValueError("size must contain positive width and height")
+            img = img.resize((target_width, target_height), resample=resample)
+
         return img
 
-    def render_to_array(self, canvas: Canvas) -> np.ndarray:
+    def render_to_array(
+        self,
+        canvas: Canvas,
+        size: tuple[int, int] | None = None,
+        resample: Image.Resampling = Image.Resampling.BILINEAR,
+    ) -> np.ndarray:
         """Render to a numpy array of shape (height, width, 3), dtype uint8.
 
         This is the format expected by gymnasium's rgb_array render mode
         and by CNN-based observation encoders.
         """
-        return np.array(self.render(canvas))
+        return np.asarray(self.render(canvas, size=size, resample=resample), dtype=np.uint8)
 
     def save(self, canvas: Canvas, path: str | Path) -> None:
         """Render and save to a file (PNG, JPEG, etc. based on extension)."""

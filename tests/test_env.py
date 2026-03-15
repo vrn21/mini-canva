@@ -12,9 +12,17 @@ from env.spaces import (
     ACTION_MOVE,
     ACTION_RECOLOR,
     ACTION_REMOVE,
+    DEFAULT_PIXEL_SIZE,
     NUM_ELEMENT_FEATURES,
+    OBSERVATION_MODE_PIXELS,
+    OBSERVATION_MODE_SEMANTIC,
+    OBSERVATION_MODE_SEMANTIC_PIXELS,
 )
-from env.wrappers import DenseRewardWrapper, FlatActionWrapper, PixelObservationWrapper
+from env.wrappers import (
+    DenseRewardWrapper,
+    FlatActionWrapper,
+    PixelObservationWrapper,
+)
 
 
 class TestEnvCreation:
@@ -36,6 +44,17 @@ class TestEnvCreation:
         assert obs_space["elements"].shape == (10, NUM_ELEMENT_FEATURES)
         assert obs_space["element_mask"].n == 10
         assert obs_space["step_fraction"].shape == (1,)
+        env.close()
+
+    def test_semantic_plus_pixels_mode_observation_space(self):
+        env = MarketCanvasEnv(observation_mode=OBSERVATION_MODE_SEMANTIC_PIXELS)
+        assert env.observation_space["elements"].shape == (20, NUM_ELEMENT_FEATURES)
+        assert env.observation_space["pixels"].shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        env.close()
+
+    def test_pixels_only_mode_observation_space(self):
+        env = MarketCanvasEnv(observation_mode=OBSERVATION_MODE_PIXELS)
+        assert env.observation_space.shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
         env.close()
 
 
@@ -72,6 +91,24 @@ class TestEnvReset:
     def test_observation_in_space(self):
         env = MarketCanvasEnv()
         obs, _ = env.reset(seed=42)
+        assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_reset_returns_semantic_plus_pixels_observation(self):
+        env = MarketCanvasEnv(observation_mode=OBSERVATION_MODE_SEMANTIC_PIXELS)
+        obs, _ = env.reset(seed=42)
+        assert "pixels" in obs
+        assert obs["pixels"].shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        assert obs["pixels"].dtype == np.uint8
+        assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_reset_returns_pixels_only_observation(self):
+        env = MarketCanvasEnv(observation_mode=OBSERVATION_MODE_PIXELS)
+        obs, _ = env.reset(seed=42)
+        assert isinstance(obs, np.ndarray)
+        assert obs.shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        assert obs.dtype == np.uint8
         assert env.observation_space.contains(obs)
         env.close()
 
@@ -225,6 +262,17 @@ class TestEnvRender:
         assert env.render() is None
         env.close()
 
+    def test_pixels_only_mode_still_keeps_native_render_resolution(self):
+        env = MarketCanvasEnv(
+            render_mode="rgb_array",
+            observation_mode=OBSERVATION_MODE_PIXELS,
+        )
+        obs, _ = env.reset(seed=42)
+        img = env.render()
+        assert obs.shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        assert img.shape == (600, 800, 3)
+        env.close()
+
 
 class TestSemanticState:
     def test_get_semantic_state(self):
@@ -278,15 +326,69 @@ class TestWrappers:
         env = PixelObservationWrapper(MarketCanvasEnv())
         obs, _ = env.reset(seed=42)
         assert "pixels" in obs
-        assert obs["pixels"].shape == (600, 800, 3)
+        assert obs["pixels"].shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
         assert obs["pixels"].dtype == np.uint8
         assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_pixel_observation_wrapper_pixels_only(self):
+        env = PixelObservationWrapper(MarketCanvasEnv(), include_semantic=False)
+        obs, _ = env.reset(seed=42)
+        assert isinstance(obs, np.ndarray)
+        assert obs.shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        assert obs.dtype == np.uint8
+        assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_pixel_observation_wrapper_is_deterministic_for_same_state(self):
+        first_env = PixelObservationWrapper(MarketCanvasEnv())
+        second_env = PixelObservationWrapper(MarketCanvasEnv())
+
+        first_obs, _ = first_env.reset(seed=42)
+        second_obs, _ = second_env.reset(seed=42)
+        assert np.array_equal(first_obs["pixels"], second_obs["pixels"])
+
+        action = {
+            "action_type": ACTION_ADD_TEXT,
+            "element_idx": 0,
+            "x": 100,
+            "y": 100,
+            "width": 200,
+            "height": 50,
+            "color_idx": 0,
+            "content_idx": 0,
+        }
+        first_obs, _, _, _, _ = first_env.step(action)
+        second_obs, _, _, _, _ = second_env.step(action)
+        assert np.array_equal(first_obs["pixels"], second_obs["pixels"])
+
+        first_env.close()
+        second_env.close()
+
+    def test_pixel_wrapper_keeps_native_render_full_resolution(self):
+        env = PixelObservationWrapper(MarketCanvasEnv(render_mode="rgb_array"))
+        obs, _ = env.reset(seed=42)
+        native = env.render()
+
+        assert obs["pixels"].shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        assert isinstance(native, np.ndarray)
+        assert native.shape == (600, 800, 3)
+        assert native.dtype == np.uint8
         env.close()
 
     def test_flat_action_wrapper(self):
         env = FlatActionWrapper(MarketCanvasEnv())
         assert isinstance(env.action_space, gymnasium.spaces.MultiDiscrete)
         env.reset(seed=42)
+        obs, _, _, _, _ = env.step(env.action_space.sample())
+        assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_flat_action_wrapper_composes_with_pixel_wrapper(self):
+        env = FlatActionWrapper(PixelObservationWrapper(MarketCanvasEnv()))
+        assert isinstance(env.action_space, gymnasium.spaces.MultiDiscrete)
+        obs, _ = env.reset(seed=42)
+        assert env.observation_space.contains(obs)
         obs, _, _, _, _ = env.step(env.action_space.sample())
         assert env.observation_space.contains(obs)
         env.close()

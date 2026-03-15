@@ -6,13 +6,21 @@ import numpy as np
 from env.market_canvas_env import MarketCanvasEnv
 from engine.types import ElementType
 from env.spaces import (
+    ACTION_INTERFACE_LOW_LEVEL,
     ACTION_ADD_SHAPE,
     ACTION_ADD_TEXT,
     ACTION_DONE,
     ACTION_MOVE,
     ACTION_RECOLOR,
     ACTION_REMOVE,
+    ACTIVE_TOOL_TEXT,
     DEFAULT_PIXEL_SIZE,
+    LOW_LEVEL_ACTION_DONE,
+    LOW_LEVEL_ACTION_KEYBOARD_TYPE,
+    LOW_LEVEL_ACTION_MOUSE_CLICK,
+    LOW_LEVEL_ACTION_MOUSE_DRAG,
+    LOW_LEVEL_ACTION_MOUSE_MOVE,
+    LOW_LEVEL_ACTION_SET_TOOL,
     NUM_ELEMENT_FEATURES,
     OBSERVATION_MODE_PIXELS,
     OBSERVATION_MODE_SEMANTIC,
@@ -55,6 +63,13 @@ class TestEnvCreation:
     def test_pixels_only_mode_observation_space(self):
         env = MarketCanvasEnv(observation_mode=OBSERVATION_MODE_PIXELS)
         assert env.observation_space.shape == (DEFAULT_PIXEL_SIZE[1], DEFAULT_PIXEL_SIZE[0], 3)
+        env.close()
+
+    def test_low_level_action_interface_uses_interaction_spaces(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        assert "cursor" in env.observation_space.spaces
+        assert "active_tool" in env.observation_space.spaces
+        assert "text" in env.action_space.spaces
         env.close()
 
 
@@ -125,6 +140,15 @@ class TestEnvReset:
         )
         assert info["prompt"].startswith("Create a Summer Sale")
         assert int(obs["prompt_id"]) == 0
+        env.close()
+
+    def test_low_level_reset_initializes_interaction_state(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        obs, info = env.reset(seed=42)
+        assert "cursor" in obs
+        assert tuple(obs["cursor"]) == (0.0, 0.0)
+        assert int(obs["active_tool"]) == 0
+        assert info["interaction"]["active_tool"] == "select"
         env.close()
 
 
@@ -243,6 +267,99 @@ class TestEnvStep:
             assert -1.0 <= reward <= 1.0
             if terminated or truncated:
                 break
+        env.close()
+
+    @staticmethod
+    def _make_low_level_action(action_type: int, **overrides: object) -> dict[str, object]:
+        action: dict[str, object] = {
+            "action_type": action_type,
+            "x": 0,
+            "y": 0,
+            "x2": 0,
+            "y2": 0,
+            "tool": 0,
+            "text": "",
+        }
+        action.update(overrides)
+        return action
+
+    def test_low_level_mouse_move_updates_cursor_observation(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        env.reset(seed=42)
+        obs, _, _, _, info = env.step(self._make_low_level_action(LOW_LEVEL_ACTION_MOUSE_MOVE, x=400, y=300))
+        assert np.allclose(obs["cursor"], np.array([400 / 799, 300 / 599], dtype=np.float32))
+        assert info["interaction"]["cursor"] == {"x": 400, "y": 300}
+        env.close()
+
+    def test_low_level_click_creates_text_after_tool_selection(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        env.reset(seed=42)
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_SET_TOOL, tool=ACTIVE_TOOL_TEXT))
+        _, _, _, _, info = env.step(
+            self._make_low_level_action(LOW_LEVEL_ACTION_MOUSE_CLICK, x=200, y=120)
+        )
+        assert info["action_result"]["success"] is True
+        element = env._canvas.get_all_elements()[0]
+        assert element.type == ElementType.TEXT
+        assert info["interaction"]["focused_element_id"] == element.id
+        env.close()
+
+    def test_low_level_drag_moves_selected_element(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        env.reset(seed=42)
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_SET_TOOL, tool=ACTIVE_TOOL_TEXT))
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_MOUSE_CLICK))
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_SET_TOOL, tool=0))
+        element = env._canvas.get_all_elements()[0]
+        original_x = element.x
+        original_y = element.y
+        start_x, start_y = element.x + 10, element.y + 10
+        _, _, _, _, info = env.step(
+            self._make_low_level_action(
+                LOW_LEVEL_ACTION_MOUSE_DRAG,
+                x=start_x,
+                y=start_y,
+                x2=start_x + 40,
+                y2=start_y + 25,
+            )
+        )
+        moved = env._canvas.get_all_elements()[0]
+        assert info["action_result"]["success"] is True
+        assert moved.x == original_x + 40
+        assert moved.y == original_y + 25
+        env.close()
+
+    def test_low_level_keyboard_type_replaces_focused_content(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        env.reset(seed=42)
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_SET_TOOL, tool=ACTIVE_TOOL_TEXT))
+        env.step(self._make_low_level_action(LOW_LEVEL_ACTION_MOUSE_CLICK))
+        _, _, _, _, info = env.step(
+            self._make_low_level_action(LOW_LEVEL_ACTION_KEYBOARD_TYPE, text="Black Friday Blowout")
+        )
+        assert info["action_result"]["success"] is True
+        assert env._canvas.get_all_elements()[0].content == "Black Friday Blowout"
+        env.close()
+
+    def test_low_level_done_terminates(self):
+        env = MarketCanvasEnv(action_interface=ACTION_INTERFACE_LOW_LEVEL)
+        env.reset(seed=42)
+        _, reward, terminated, truncated, _ = env.step(self._make_low_level_action(LOW_LEVEL_ACTION_DONE))
+        assert terminated is True
+        assert truncated is False
+        assert reward != 0.0
+        env.close()
+
+    def test_low_level_pixels_mode_renders_cursor_overlay(self):
+        env = MarketCanvasEnv(
+            action_interface=ACTION_INTERFACE_LOW_LEVEL,
+            observation_mode=OBSERVATION_MODE_PIXELS,
+        )
+        obs, _ = env.reset(seed=42)
+        moved_obs, _, _, _, _ = env.step(
+            self._make_low_level_action(LOW_LEVEL_ACTION_MOUSE_MOVE, x=400, y=300)
+        )
+        assert not np.array_equal(obs, moved_obs)
         env.close()
 
 

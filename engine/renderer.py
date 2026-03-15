@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -33,6 +33,7 @@ class CanvasRenderer:
         canvas: Canvas,
         size: tuple[int, int] | None = None,
         resample: Image.Resampling = Image.Resampling.BILINEAR,
+        overlay: dict[str, Any] | None = None,
     ) -> Image.Image:
         """Render the canvas state to a PIL Image.
 
@@ -59,6 +60,10 @@ class CanvasRenderer:
                 raise ValueError("size must contain positive width and height")
             img = img.resize((target_width, target_height), resample=resample)
 
+        if overlay is not None:
+            overlay_draw = ImageDraw.Draw(img)
+            self._draw_overlay(overlay_draw, canvas, img.size, overlay)
+
         return img
 
     def render_to_array(
@@ -66,13 +71,17 @@ class CanvasRenderer:
         canvas: Canvas,
         size: tuple[int, int] | None = None,
         resample: Image.Resampling = Image.Resampling.BILINEAR,
+        overlay: dict[str, Any] | None = None,
     ) -> np.ndarray:
         """Render to a numpy array of shape (height, width, 3), dtype uint8.
 
         This is the format expected by gymnasium's rgb_array render mode
         and by CNN-based observation encoders.
         """
-        return np.asarray(self.render(canvas, size=size, resample=resample), dtype=np.uint8)
+        return np.asarray(
+            self.render(canvas, size=size, resample=resample, overlay=overlay),
+            dtype=np.uint8,
+        )
 
     def save(self, canvas: Canvas, path: str | Path) -> None:
         """Render and save to a file (PNG, JPEG, etc. based on extension)."""
@@ -119,6 +128,112 @@ class CanvasRenderer:
                 fill=line_color,
                 font=font,
             )
+
+    def _draw_overlay(
+        self,
+        draw: ImageDraw.ImageDraw,
+        canvas: Canvas,
+        image_size: tuple[int, int],
+        overlay: dict[str, Any],
+    ) -> None:
+        """Draw low-level interaction state on top of the rendered canvas."""
+
+        image_width, image_height = image_size
+        canvas_width = max(1, canvas.config.width)
+        canvas_height = max(1, canvas.config.height)
+        scale_x = image_width / canvas_width
+        scale_y = image_height / canvas_height
+
+        selected_id = overlay.get("selected_element_id")
+        focused_id = overlay.get("focused_element_id")
+        if selected_id:
+            element = canvas.get_element(str(selected_id))
+            if element is not None:
+                self._draw_scaled_outline(draw, element, scale_x, scale_y, "#00D1FF", width=2)
+        if focused_id:
+            element = canvas.get_element(str(focused_id))
+            if element is not None:
+                self._draw_scaled_outline(draw, element, scale_x, scale_y, "#FF4FD8", width=1)
+
+        cursor = overlay.get("cursor")
+        if isinstance(cursor, dict):
+            cursor_x = int(round(float(cursor.get("x", 0)) * scale_x))
+            cursor_y = int(round(float(cursor.get("y", 0)) * scale_y))
+            self._draw_cursor(draw, cursor_x, cursor_y, image_width, image_height)
+
+        active_tool = overlay.get("active_tool")
+        if isinstance(active_tool, str):
+            self._draw_tool_indicator(draw, active_tool)
+
+    @staticmethod
+    def _draw_scaled_outline(
+        draw: ImageDraw.ImageDraw,
+        element: Element,
+        scale_x: float,
+        scale_y: float,
+        color: str,
+        *,
+        width: int,
+    ) -> None:
+        """Draw a scaled rectangle outline around an element."""
+
+        left, top, right, bottom = element.bounds
+        scaled_bounds = [
+            int(round(left * scale_x)),
+            int(round(top * scale_y)),
+            max(int(round(left * scale_x)) + 1, int(round(right * scale_x))),
+            max(int(round(top * scale_y)) + 1, int(round(bottom * scale_y))),
+        ]
+        draw.rectangle(scaled_bounds, outline=color, width=width)
+
+    @staticmethod
+    def _draw_cursor(
+        draw: ImageDraw.ImageDraw,
+        x: int,
+        y: int,
+        image_width: int,
+        image_height: int,
+    ) -> None:
+        """Draw a visible cursor crosshair."""
+
+        arm = 6
+        left = max(0, x - arm)
+        right = min(image_width - 1, x + arm)
+        top = max(0, y - arm)
+        bottom = min(image_height - 1, y + arm)
+
+        draw.line([(left, y), (right, y)], fill="#FF3B30", width=1)
+        draw.line([(x, top), (x, bottom)], fill="#FF3B30", width=1)
+        draw.ellipse(
+            [max(0, x - 2), max(0, y - 2), min(image_width - 1, x + 2), min(image_height - 1, y + 2)],
+            outline="#FFFFFF",
+            width=1,
+        )
+
+    @staticmethod
+    def _draw_tool_indicator(draw: ImageDraw.ImageDraw, active_tool: str) -> None:
+        """Draw a compact tool legend in the top-left corner."""
+
+        tool_colors = {
+            "select": "#708090",
+            "text": "#00CED1",
+            "shape": "#FFD700",
+            "image": "#4169E1",
+        }
+        start_x = 6
+        start_y = 6
+        box_size = 8
+        gap = 4
+
+        for index, tool_name in enumerate(("select", "text", "shape", "image")):
+            left = start_x + index * (box_size + gap)
+            top = start_y
+            right = left + box_size
+            bottom = top + box_size
+            fill = tool_colors[tool_name]
+            outline = "#FFFFFF" if tool_name == active_tool else "#000000"
+            border = 2 if tool_name == active_tool else 1
+            draw.rectangle([left, top, right, bottom], fill=fill, outline=outline, width=border)
 
     def _get_font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         """Get a font at the specified size, with caching."""

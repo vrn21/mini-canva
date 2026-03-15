@@ -88,6 +88,8 @@ class FlatActionWrapper(gymnasium.ActionWrapper):
         super().__init__(env)
         action_dict = self.env.action_space
         self._keys = list(action_dict.spaces.keys())
+        if not all(hasattr(action_dict.spaces[key], "n") for key in self._keys):
+            raise ValueError("FlatActionWrapper requires a Dict action space of only Discrete subspaces.")
         nvec = [action_dict.spaces[key].n for key in self._keys]
         self.action_space = gymnasium.spaces.MultiDiscrete(nvec)
 

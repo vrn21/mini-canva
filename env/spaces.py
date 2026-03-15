@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from gymnasium import spaces
 import numpy as np
@@ -20,6 +20,14 @@ OBSERVATION_MODES = (
 )
 ObservationMode = Literal["semantic", "semantic+pixels", "pixels"]
 
+ACTION_INTERFACE_SEMANTIC = "semantic"
+ACTION_INTERFACE_LOW_LEVEL = "low_level"
+ACTION_INTERFACES = (
+    ACTION_INTERFACE_SEMANTIC,
+    ACTION_INTERFACE_LOW_LEVEL,
+)
+ActionInterface = Literal["semantic", "low_level"]
+
 ACTION_ADD_TEXT = 0
 ACTION_ADD_SHAPE = 1
 ACTION_ADD_IMAGE = 2
@@ -28,6 +36,20 @@ ACTION_RECOLOR = 4
 ACTION_REMOVE = 5
 ACTION_DONE = 6
 NUM_ACTION_TYPES = 7
+
+LOW_LEVEL_ACTION_MOUSE_MOVE = 0
+LOW_LEVEL_ACTION_MOUSE_CLICK = 1
+LOW_LEVEL_ACTION_MOUSE_DRAG = 2
+LOW_LEVEL_ACTION_KEYBOARD_TYPE = 3
+LOW_LEVEL_ACTION_SET_TOOL = 4
+LOW_LEVEL_ACTION_DONE = 5
+NUM_LOW_LEVEL_ACTION_TYPES = 6
+
+ACTIVE_TOOL_SELECT = 0
+ACTIVE_TOOL_TEXT = 1
+ACTIVE_TOOL_SHAPE = 2
+ACTIVE_TOOL_IMAGE = 3
+NUM_ACTIVE_TOOLS = 4
 
 COLOR_PALETTE: tuple[str, ...] = (
     "#FFFFFF",
@@ -72,22 +94,38 @@ CONTENT_TEMPLATES: tuple[str, ...] = (
 )
 
 
-def build_observation_space(max_elements: int, num_prompts: int) -> spaces.Dict:
+def build_observation_space(
+    max_elements: int,
+    num_prompts: int,
+    *,
+    include_interaction: bool = False,
+) -> spaces.Dict:
     """Build the Gymnasium observation space."""
 
-    return spaces.Dict(
-        {
-            "elements": spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(max_elements, NUM_ELEMENT_FEATURES),
-                dtype=np.float32,
-            ),
-            "element_mask": spaces.MultiBinary(max_elements),
-            "step_fraction": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            "prompt_id": spaces.Discrete(num_prompts),
-        }
-    )
+    observation_spaces: dict[str, spaces.Space[Any]] = {
+        "elements": spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(max_elements, NUM_ELEMENT_FEATURES),
+            dtype=np.float32,
+        ),
+        "element_mask": spaces.MultiBinary(max_elements),
+        "step_fraction": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+        "prompt_id": spaces.Discrete(num_prompts),
+    }
+
+    if include_interaction:
+        observation_spaces["cursor"] = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(2,),
+            dtype=np.float32,
+        )
+        observation_spaces["active_tool"] = spaces.Discrete(NUM_ACTIVE_TOOLS)
+        observation_spaces["selected_element_idx"] = spaces.Discrete(max_elements + 1)
+        observation_spaces["focused_element_idx"] = spaces.Discrete(max_elements + 1)
+
+    return spaces.Dict(observation_spaces)
 
 
 def build_pixel_observation_space(size: tuple[int, int]) -> spaces.Box:
@@ -117,5 +155,25 @@ def build_action_space(
             "height": spaces.Discrete(canvas_height),
             "color_idx": spaces.Discrete(len(COLOR_PALETTE)),
             "content_idx": spaces.Discrete(len(CONTENT_TEMPLATES)),
+        }
+    )
+
+
+def build_low_level_action_space(
+    canvas_width: int = 800,
+    canvas_height: int = 600,
+    max_text_length: int = 64,
+) -> spaces.Dict:
+    """Build the optional low-level action space."""
+
+    return spaces.Dict(
+        {
+            "action_type": spaces.Discrete(NUM_LOW_LEVEL_ACTION_TYPES),
+            "x": spaces.Discrete(canvas_width),
+            "y": spaces.Discrete(canvas_height),
+            "x2": spaces.Discrete(canvas_width),
+            "y2": spaces.Discrete(canvas_height),
+            "tool": spaces.Discrete(NUM_ACTIVE_TOOLS),
+            "text": spaces.Text(max_length=max_text_length),
         }
     )

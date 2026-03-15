@@ -1,5 +1,14 @@
-def main():
-    print("Hello from mini-canva!")
+"""Convenience entrypoint for local manual runs."""
+
+from __future__ import annotations
+
+import demo
+
+
+def main() -> None:
+    """Run the default demo suite."""
+
+    demo.main()
 
 
 if __name__ == "__main__":

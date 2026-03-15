@@ -60,13 +60,18 @@ async def _initialize(
     mcp_client,
     seed: int = 42,
     observation_mode: str = "semantic",
+    action_interface: str = "semantic",
 ) -> dict[str, Any]:
     """Initialize the server and return the structured payload."""
 
     return _tool_data(
         await mcp_client.call_tool(
             "initialize_env",
-            {"seed": seed, "observation_mode": observation_mode},
+            {
+                "seed": seed,
+                "observation_mode": observation_mode,
+                "action_interface": action_interface,
+            },
         )
     )
 
@@ -106,6 +111,11 @@ class TestServerInitialization:
             "execute_action",
             "get_current_reward",
             "save_canvas",
+            "set_active_tool",
+            "mouse_move",
+            "mouse_click",
+            "mouse_drag",
+            "keyboard_type",
         }
 
     async def test_initialize_env_returns_prompt_and_canvas_state(self, mcp_client):
@@ -115,6 +125,7 @@ class TestServerInitialization:
         assert data["session_id"]
         assert data["prompt"]
         assert isinstance(data["prompt_id"], int)
+        assert data["action_interface"] == "semantic"
         assert data["observation_mode"] == "semantic"
         assert data["observation"]["mode"] == "semantic"
         assert data["observation"]["semantic"] is not None
@@ -350,7 +361,31 @@ class TestExecuteAction:
         data = _tool_data(result)
 
         assert data["action_result"]["success"] is False
+        assert data["observation_mode"] == "semantic"
+        assert data["observation"]["mode"] == "semantic"
         assert data["canvas_state"]["element_count"] == 0
+
+    async def test_low_level_pixels_observation_changes_after_mouse_move(self, mcp_client):
+        init = await _initialize(
+            mcp_client,
+            observation_mode="pixels",
+            action_interface="low_level",
+        )
+        before = _tool_data(
+            await mcp_client.call_tool("get_observation", {"session_id": init["session_id"]})
+        )
+        moved = _tool_data(
+            await mcp_client.call_tool(
+                "mouse_move",
+                {"session_id": init["session_id"], "x": 250, "y": 120},
+            )
+        )
+
+        assert before["mode"] == "pixels"
+        assert moved["observation"]["mode"] == "pixels"
+        assert before["pixels_shape"] == [96, 128, 3]
+        assert moved["observation"]["pixels_shape"] == [96, 128, 3]
+        assert before["pixels"] != moved["observation"]["pixels"]
 
 
 class TestBridgeBehavior:
@@ -510,3 +545,132 @@ class TestRewardAndSave:
         data = _tool_data(result)
 
         assert Path(data["path"]).is_absolute()
+
+
+class TestLowLevelTools:
+    async def test_initialize_env_low_level_reports_interface_and_interaction(self, mcp_client):
+        data = await _initialize(mcp_client, action_interface="low_level")
+
+        assert data["action_interface"] == "low_level"
+        assert data["canvas_state"]["interaction"]["active_tool"] == "select"
+        assert data["observation"]["semantic"]["cursor"] == [0.0, 0.0]
+
+    async def test_low_level_mouse_move_updates_cursor(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+        result = await mcp_client.call_tool(
+            "mouse_move",
+            {"session_id": init["session_id"], "x": 250, "y": 120},
+        )
+        data = _tool_data(result)
+
+        assert data["action_result"]["success"] is True
+        assert data["canvas_state"]["interaction"]["cursor"] == {"x": 250, "y": 120}
+
+    async def test_low_level_click_and_type_create_and_edit_text(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+        await mcp_client.call_tool(
+            "set_active_tool",
+            {"session_id": init["session_id"], "tool": "text"},
+        )
+        created = _tool_data(
+            await mcp_client.call_tool("mouse_click", {"session_id": init["session_id"]})
+        )
+        element_id = created["action_result"]["element_id"]
+
+        typed = _tool_data(
+            await mcp_client.call_tool(
+                "keyboard_type",
+                {"session_id": init["session_id"], "text": "Black Friday Blowout"},
+            )
+        )
+        element = typed["canvas_state"]["elements"][0]
+
+        assert created["action_result"]["success"] is True
+        assert element["id"] == element_id
+        assert element["content"] == "Black Friday Blowout"
+
+    async def test_low_level_drag_in_shape_mode_creates_shape(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+        await mcp_client.call_tool(
+            "set_active_tool",
+            {"session_id": init["session_id"], "tool": "shape"},
+        )
+        dragged = _tool_data(
+            await mcp_client.call_tool(
+                "mouse_drag",
+                {"session_id": init["session_id"], "x1": 100, "y1": 150, "x2": 280, "y2": 230},
+            )
+        )
+        element = dragged["canvas_state"]["elements"][0]
+
+        assert dragged["action_result"]["success"] is True
+        assert element["type"] == "SHAPE"
+        assert element["width"] == 180
+        assert element["height"] == 80
+
+    async def test_low_level_drag_in_select_mode_moves_element(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+        await mcp_client.call_tool(
+            "set_active_tool",
+            {"session_id": init["session_id"], "tool": "text"},
+        )
+        created = _tool_data(
+            await mcp_client.call_tool("mouse_click", {"session_id": init["session_id"]})
+        )
+        element = created["canvas_state"]["elements"][0]
+        start_x = element["x"] + 10
+        start_y = element["y"] + 10
+        await mcp_client.call_tool(
+            "set_active_tool",
+            {"session_id": init["session_id"], "tool": "select"},
+        )
+        moved = _tool_data(
+            await mcp_client.call_tool(
+                "mouse_drag",
+                {
+                    "session_id": init["session_id"],
+                    "x1": start_x,
+                    "y1": start_y,
+                    "x2": start_x + 30,
+                    "y2": start_y + 20,
+                },
+            )
+        )
+        moved_element = moved["canvas_state"]["elements"][0]
+
+        assert moved["action_result"]["success"] is True
+        assert moved_element["x"] == element["x"] + 30
+        assert moved_element["y"] == element["y"] + 20
+
+    async def test_low_level_tools_error_in_semantic_mode(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="semantic")
+
+        with pytest.raises(Exception):
+            await mcp_client.call_tool(
+                "mouse_click",
+                {"session_id": init["session_id"]},
+            )
+
+    async def test_semantic_mutation_actions_are_rejected_in_low_level_mode(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+
+        with pytest.raises(Exception):
+            await mcp_client.call_tool(
+                "execute_action",
+                {
+                    "session_id": init["session_id"],
+                    "action_type": "add_text",
+                    "content": "Summer Sale",
+                },
+            )
+
+    async def test_execute_action_done_still_finishes_low_level_episode(self, mcp_client):
+        init = await _initialize(mcp_client, action_interface="low_level")
+        result = await mcp_client.call_tool(
+            "execute_action",
+            {"session_id": init["session_id"], "action_type": "done"},
+        )
+        data = _tool_data(result)
+
+        assert data["terminated"] is True
+        assert data["action_result"]["action"] == "done"

@@ -11,7 +11,11 @@ from engine.canvas import Canvas
 from engine.renderer import CanvasRenderer
 from engine.types import CanvasConfig, ElementType
 
+from env.interaction import LowLevelController
 from env.spaces import (
+    ACTION_INTERFACE_LOW_LEVEL,
+    ACTION_INTERFACE_SEMANTIC,
+    ACTION_INTERFACES,
     ACTION_ADD_IMAGE,
     ACTION_ADD_SHAPE,
     ACTION_ADD_TEXT,
@@ -19,9 +23,16 @@ from env.spaces import (
     ACTION_MOVE,
     ACTION_RECOLOR,
     ACTION_REMOVE,
+    ActionInterface,
     COLOR_PALETTE,
     CONTENT_TEMPLATES,
     DEFAULT_PIXEL_SIZE,
+    LOW_LEVEL_ACTION_DONE,
+    LOW_LEVEL_ACTION_KEYBOARD_TYPE,
+    LOW_LEVEL_ACTION_MOUSE_CLICK,
+    LOW_LEVEL_ACTION_MOUSE_DRAG,
+    LOW_LEVEL_ACTION_MOUSE_MOVE,
+    LOW_LEVEL_ACTION_SET_TOOL,
     NUM_ELEMENT_FEATURES,
     OBSERVATION_MODE_PIXELS,
     OBSERVATION_MODE_SEMANTIC,
@@ -29,6 +40,7 @@ from env.spaces import (
     OBSERVATION_MODES,
     ObservationMode,
     build_action_space,
+    build_low_level_action_space,
     build_observation_space,
     build_pixel_observation_space,
 )
@@ -55,6 +67,7 @@ class MarketCanvasEnv(gymnasium.Env):
         reward_weights: dict[str, float] | None = None,
         observation_mode: ObservationMode = OBSERVATION_MODE_SEMANTIC,
         pixel_size: tuple[int, int] = DEFAULT_PIXEL_SIZE,
+        action_interface: ActionInterface = ACTION_INTERFACE_SEMANTIC,
     ) -> None:
         super().__init__()
 
@@ -62,6 +75,8 @@ class MarketCanvasEnv(gymnasium.Env):
             raise ValueError(f"Unsupported render mode: {render_mode}")
         if observation_mode not in OBSERVATION_MODES:
             raise ValueError(f"Unsupported observation_mode: {observation_mode}")
+        if action_interface not in ACTION_INTERFACES:
+            raise ValueError(f"Unsupported action_interface: {action_interface}")
 
         pixel_width, pixel_height = pixel_size
         if pixel_width <= 0 or pixel_height <= 0:
@@ -74,6 +89,7 @@ class MarketCanvasEnv(gymnasium.Env):
         self.max_elements = max_elements
         self.observation_mode = observation_mode
         self.pixel_size = (int(pixel_width), int(pixel_height))
+        self.action_interface = action_interface
 
         self._config = CanvasConfig(
             width=canvas_width,
@@ -82,14 +98,23 @@ class MarketCanvasEnv(gymnasium.Env):
         )
         self._canvas = Canvas(self._config)
         self._renderer = CanvasRenderer()
+        self._interaction = LowLevelController(canvas_width, canvas_height)
 
         self._reward_calc = RewardCalculator(weights=reward_weights)
         self._prompt_bank = PromptBank()
 
         self.observation_space = self._build_observation_space()
-        self.action_space = build_action_space(
-            max_elements, canvas_width=canvas_width, canvas_height=canvas_height
-        )
+        if self.action_interface == ACTION_INTERFACE_LOW_LEVEL:
+            self.action_space = build_low_level_action_space(
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
+        else:
+            self.action_space = build_action_space(
+                max_elements,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
 
         self._current_prompt: TargetPrompt | None = None
         self._current_prompt_id: int = 0
@@ -106,6 +131,7 @@ class MarketCanvasEnv(gymnasium.Env):
         options = options or {}
 
         self._canvas.clear()
+        self._interaction.reset()
         self._step_count = 0
         self._current_prompt_id, self._current_prompt = self._resolve_prompt(options)
 
@@ -116,10 +142,14 @@ class MarketCanvasEnv(gymnasium.Env):
     ) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Execute one action on the canvas."""
 
-        action_result = self._execute_action(action)
+        if self.action_interface == ACTION_INTERFACE_LOW_LEVEL:
+            action_result = self._execute_low_level_action(action)
+            terminated = int(action["action_type"]) == LOW_LEVEL_ACTION_DONE
+        else:
+            action_result = self._execute_action(action)
+            terminated = int(action["action_type"]) == ACTION_DONE
         self._step_count += 1
 
-        terminated = int(action["action_type"]) == ACTION_DONE
         truncated = self._step_count >= self.max_steps
 
         reward_breakdown: dict[str, Any] = {}
@@ -147,17 +177,25 @@ class MarketCanvasEnv(gymnasium.Env):
     def get_semantic_state(self) -> dict[str, Any]:
         """Full JSON state for MCP/LLM agents."""
 
+        self._interaction.sync_with_canvas(self._canvas)
         state = self._canvas.to_dict()
         state["target_prompt"] = self._current_prompt.text if self._current_prompt else ""
         state["step_count"] = self._step_count
         state["max_steps"] = self.max_steps
         state["spatial_relationships"] = self._build_spatial_relationships()
+        state["interaction"] = self._interaction.state.to_dict(
+            action_interface=self.action_interface
+        )
         return state
 
     def get_pixels(self) -> np.ndarray:
         """Return the training-time RGB observation for the current canvas."""
 
-        return self._renderer.render_to_array(self._canvas, size=self.pixel_size)
+        return self._renderer.render_to_array(
+            self._canvas,
+            size=self.pixel_size,
+            overlay=self._pixel_overlay(),
+        )
 
     def get_observation(self) -> dict[str, Any] | np.ndarray:
         """Return the current observation in the configured observation mode."""
@@ -197,6 +235,32 @@ class MarketCanvasEnv(gymnasium.Env):
             return self._action_remove(action)
         if action_type == ACTION_DONE:
             return {"action": "done"}
+
+        return {"action": "unknown", "success": False}
+
+    def _execute_low_level_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Parse and apply a low-level interaction action."""
+
+        action_type = int(action["action_type"])
+
+        if action_type == LOW_LEVEL_ACTION_MOUSE_MOVE:
+            return self._interaction.move_cursor(int(action["x"]), int(action["y"]))
+        if action_type == LOW_LEVEL_ACTION_MOUSE_CLICK:
+            return self._interaction.mouse_click(self._canvas)
+        if action_type == LOW_LEVEL_ACTION_MOUSE_DRAG:
+            return self._interaction.mouse_drag(
+                self._canvas,
+                int(action["x"]),
+                int(action["y"]),
+                int(action["x2"]),
+                int(action["y2"]),
+            )
+        if action_type == LOW_LEVEL_ACTION_KEYBOARD_TYPE:
+            return self._interaction.keyboard_type(self._canvas, str(action["text"]))
+        if action_type == LOW_LEVEL_ACTION_SET_TOOL:
+            return self._interaction.set_active_tool(int(action["tool"]))
+        if action_type == LOW_LEVEL_ACTION_DONE:
+            return {"action": "done", "success": True}
 
         return {"action": "unknown", "success": False}
 
@@ -282,6 +346,7 @@ class MarketCanvasEnv(gymnasium.Env):
         semantic_space = build_observation_space(
             self.max_elements,
             num_prompts=len(self._prompt_bank.PROMPTS),
+            include_interaction=self.action_interface == ACTION_INTERFACE_LOW_LEVEL,
         )
         pixel_space = build_pixel_observation_space(self.pixel_size)
 
@@ -292,6 +357,15 @@ class MarketCanvasEnv(gymnasium.Env):
             new_spaces["pixels"] = pixel_space
             return gymnasium.spaces.Dict(new_spaces)
         return pixel_space
+
+    def _pixel_overlay(self) -> dict[str, Any] | None:
+        """Build the rollout-pixel overlay for low-level interaction state."""
+
+        if self.action_interface != ACTION_INTERFACE_LOW_LEVEL:
+            return None
+
+        self._interaction.sync_with_canvas(self._canvas)
+        return self._interaction.state.to_dict(action_interface=self.action_interface)
 
     def _get_obs(self) -> dict[str, Any] | np.ndarray:
         """Build a Gymnasium-compatible observation for the configured mode."""
@@ -308,6 +382,7 @@ class MarketCanvasEnv(gymnasium.Env):
     def _get_semantic_obs(self) -> dict[str, Any]:
         """Build the semantic observation dict."""
 
+        self._interaction.sync_with_canvas(self._canvas)
         elements = self._canvas.get_all_elements()
         features = np.zeros((self.max_elements, NUM_ELEMENT_FEATURES), dtype=np.float32)
         mask = np.zeros(self.max_elements, dtype=np.int8)
@@ -354,12 +429,31 @@ class MarketCanvasEnv(gymnasium.Env):
             [min(1.0, self._step_count / self.max_steps) if self.max_steps > 0 else 0.0],
             dtype=np.float32,
         )
-        return {
+        observation: dict[str, Any] = {
             "elements": features,
             "element_mask": mask,
             "step_fraction": step_fraction,
             "prompt_id": np.int64(self._current_prompt_id),
         }
+
+        if self.action_interface == ACTION_INTERFACE_LOW_LEVEL:
+            cursor = np.array(
+                [
+                    self._interaction.state.cursor_x / max(1.0, float(self._canvas_width - 1)),
+                    self._interaction.state.cursor_y / max(1.0, float(self._canvas_height - 1)),
+                ],
+                dtype=np.float32,
+            )
+            observation["cursor"] = cursor
+            observation["active_tool"] = np.int64(self._interaction.state.active_tool)
+            observation["selected_element_idx"] = np.int64(
+                self._interaction.selected_element_index(self._canvas, self.max_elements)
+            )
+            observation["focused_element_idx"] = np.int64(
+                self._interaction.focused_element_index(self._canvas, self.max_elements)
+            )
+
+        return observation
 
     def _get_info(self, terminal: bool = False) -> dict[str, Any]:
         """Build info dict with human-readable debug data."""
@@ -368,7 +462,12 @@ class MarketCanvasEnv(gymnasium.Env):
             "element_count": self._canvas.element_count,
             "step_count": self._step_count,
             "prompt": self._current_prompt.text if self._current_prompt else "",
+            "action_interface": self.action_interface,
         }
+        if self.action_interface == ACTION_INTERFACE_LOW_LEVEL:
+            info["interaction"] = self._interaction.state.to_dict(
+                action_interface=self.action_interface
+            )
         if terminal:
             info["semantic_state"] = self.get_semantic_state()
         return info

@@ -13,24 +13,44 @@ from env.spaces import ACTION_DONE
 
 class TestProgrammaticDemo:
     def test_demo_programmatic_returns_summary(self, tmp_path: Path):
-        result = demo.demo_programmatic(output_path=tmp_path / "programmatic.png")
+        result = demo.demo_programmatic(
+            output_path=tmp_path / "programmatic.png",
+            pixel_output_path=tmp_path / "programmatic_pixels.png",
+        )
 
         assert result["prompt"]
         assert isinstance(result["prompt_id"], int)
         assert result["steps_executed"] >= 1
         assert isinstance(result["final_reward"], float)
+        assert result["action_interface"] == "semantic"
+        assert result["observation"]["observation_mode"] == "semantic+pixels"
+        assert result["observation"]["pixel_shape"] == [96, 128, 3]
         assert "target_prompt" in result["semantic_state"]
 
     def test_demo_programmatic_writes_output_image(self, tmp_path: Path):
         output_path = tmp_path / "programmatic.png"
-        result = demo.demo_programmatic(output_path=output_path)
+        pixel_output_path = tmp_path / "programmatic_pixels.png"
+        result = demo.demo_programmatic(
+            output_path=output_path,
+            pixel_output_path=pixel_output_path,
+        )
 
         assert output_path.exists()
+        assert pixel_output_path.exists()
         assert result["output_path"] == str(output_path.resolve())
+        assert result["pixel_output_path"] == str(pixel_output_path.resolve())
 
     def test_demo_programmatic_is_deterministic_for_fixed_seed(self, tmp_path: Path):
-        first = demo.demo_programmatic(seed=42, output_path=tmp_path / "first.png")
-        second = demo.demo_programmatic(seed=42, output_path=tmp_path / "second.png")
+        first = demo.demo_programmatic(
+            seed=42,
+            output_path=tmp_path / "first.png",
+            pixel_output_path=tmp_path / "first_pixels.png",
+        )
+        second = demo.demo_programmatic(
+            seed=42,
+            output_path=tmp_path / "second.png",
+            pixel_output_path=tmp_path / "second_pixels.png",
+        )
 
         assert first["prompt"] == second["prompt"]
         assert first["prompt_id"] == second["prompt_id"]
@@ -40,7 +60,10 @@ class TestProgrammaticDemo:
         assert first["final_reward"] == second["final_reward"]
 
     def test_demo_programmatic_semantic_state_has_target_prompt(self, tmp_path: Path):
-        result = demo.demo_programmatic(output_path=tmp_path / "semantic.png")
+        result = demo.demo_programmatic(
+            output_path=tmp_path / "semantic.png",
+            pixel_output_path=tmp_path / "semantic_pixels.png",
+        )
 
         assert result["semantic_state"]["target_prompt"] == result["prompt"]
 
@@ -52,10 +75,50 @@ class TestProgrammaticDemo:
         result = demo.demo_programmatic(
             prompt_text=prompt_text,
             output_path=tmp_path / "summer-sale.png",
+            pixel_output_path=tmp_path / "summer-sale-pixels.png",
         )
 
         assert result["prompt"] == prompt_text
         assert result["prompt_id"] == 0
+
+    def test_demo_programmatic_can_run_pixels_only(self, tmp_path: Path):
+        result = demo.demo_programmatic(
+            output_path=tmp_path / "pixels-only-full.png",
+            pixel_output_path=tmp_path / "pixels-only-rollout.png",
+            observation_mode="pixels",
+        )
+
+        assert result["observation"]["observation_mode"] == "pixels"
+        assert result["observation"]["semantic_keys"] is None
+        assert result["pixel_output_path"]
+
+
+class TestLowLevelDemo:
+    def test_demo_low_level_returns_summary(self, tmp_path: Path):
+        result = demo.demo_low_level(
+            output_path=tmp_path / "low-level.png",
+            pixel_output_path=tmp_path / "low-level-pixels.png",
+        )
+
+        assert result["prompt"]
+        assert result["action_interface"] == "low_level"
+        assert result["observation"]["observation_mode"] == "semantic+pixels"
+        assert result["observation"]["pixel_shape"] == [96, 128, 3]
+        assert "cursor" in result["interaction"]
+        assert "interaction" in result["semantic_state"]
+
+    def test_demo_low_level_writes_images(self, tmp_path: Path):
+        output_path = tmp_path / "low-level.png"
+        pixel_output_path = tmp_path / "low-level-pixels.png"
+        result = demo.demo_low_level(
+            output_path=output_path,
+            pixel_output_path=pixel_output_path,
+        )
+
+        assert output_path.exists()
+        assert pixel_output_path.exists()
+        assert result["output_path"] == str(output_path.resolve())
+        assert result["pixel_output_path"] == str(pixel_output_path.resolve())
 
 
 class TestRandomDemo:
@@ -107,10 +170,15 @@ class TestMain:
         )
         monkeypatch.setattr(
             demo,
+            "demo_low_level",
+            lambda *args, **kwargs: calls.append("low_level") or {},
+        )
+        monkeypatch.setattr(
+            demo,
             "demo_random",
             lambda *args, **kwargs: calls.append("random") or {},
         )
 
         demo.main()
 
-        assert calls == ["programmatic", "random"]
+        assert calls == ["programmatic", "low_level", "random"]

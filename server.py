@@ -14,8 +14,11 @@ from fastmcp import FastMCP
 import numpy as np
 
 from engine.types import ElementType
+from env.interaction import tool_name_to_code
 from env.market_canvas_env import MarketCanvasEnv
 from env.spaces import (
+    ACTION_INTERFACE_LOW_LEVEL,
+    ACTION_INTERFACE_SEMANTIC,
     ACTION_ADD_IMAGE,
     ACTION_ADD_SHAPE,
     ACTION_ADD_TEXT,
@@ -23,8 +26,20 @@ from env.spaces import (
     ACTION_MOVE,
     ACTION_RECOLOR,
     ACTION_REMOVE,
+    ACTION_INTERFACES,
+    ACTIVE_TOOL_IMAGE,
+    ACTIVE_TOOL_SELECT,
+    ACTIVE_TOOL_SHAPE,
+    ACTIVE_TOOL_TEXT,
+    ActionInterface,
     COLOR_PALETTE,
     CONTENT_TEMPLATES,
+    LOW_LEVEL_ACTION_DONE,
+    LOW_LEVEL_ACTION_KEYBOARD_TYPE,
+    LOW_LEVEL_ACTION_MOUSE_CLICK,
+    LOW_LEVEL_ACTION_MOUSE_DRAG,
+    LOW_LEVEL_ACTION_MOUSE_MOVE,
+    LOW_LEVEL_ACTION_SET_TOOL,
     OBSERVATION_MODE_SEMANTIC,
     OBSERVATION_MODE_SEMANTIC_PIXELS,
     OBSERVATION_MODES,
@@ -41,6 +56,7 @@ ActionName = Literal[
     "remove",
     "done",
 ]
+LowLevelToolName = Literal["select", "text", "shape", "image"]
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _MIN_ELEMENT_SIZE = 20
@@ -126,6 +142,38 @@ def _observation_payload(env: MarketCanvasEnv) -> dict[str, Any]:
     payload["pixels_shape"] = list(pixels.shape)
     payload["pixels_dtype"] = str(pixels.dtype)
     return payload
+
+
+def _step_payload(
+    env: MarketCanvasEnv,
+    *,
+    step_reward: float,
+    terminated: bool,
+    truncated: bool,
+    info: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a stable MCP response after a successful env.step call."""
+
+    current_reward, current_breakdown = env.compute_reward()
+    reward_breakdown: dict[str, Any] = {}
+    reward = float(step_reward)
+    if terminated or truncated:
+        reward = float(current_reward)
+        reward_breakdown = current_breakdown
+
+    return {
+        "action_interface": env.action_interface,
+        "observation_mode": env.observation_mode,
+        "observation": _observation_payload(env),
+        "canvas_state": _semantic_state(env),
+        "reward": reward,
+        "current_reward": float(current_reward),
+        "terminated": terminated,
+        "truncated": truncated,
+        "reward_breakdown": reward_breakdown,
+        "current_reward_breakdown": current_breakdown,
+        "action_result": dict(info.get("action_result", {})),
+    }
 
 
 def _element_id_to_idx(env: MarketCanvasEnv, element_id: str) -> int | None:
@@ -218,6 +266,20 @@ def _base_action(env: MarketCanvasEnv) -> dict[str, int]:
         "height": _MIN_ELEMENT_SIZE,
         "color_idx": 0,
         "content_idx": 0,
+    }
+
+
+def _base_low_level_action() -> dict[str, Any]:
+    """Construct a fully-populated low-level env action dict."""
+
+    return {
+        "action_type": LOW_LEVEL_ACTION_DONE,
+        "x": 0,
+        "y": 0,
+        "x2": 0,
+        "y2": 0,
+        "tool": ACTIVE_TOOL_SELECT,
+        "text": "",
     }
 
 
@@ -366,6 +428,9 @@ def _noop_failure(
 
     current_reward, current_breakdown = env.compute_reward()
     return {
+        "action_interface": env.action_interface,
+        "observation_mode": env.observation_mode,
+        "observation": _observation_payload(env),
         "canvas_state": _semantic_state(env),
         "reward": 0.0,
         "current_reward": float(current_reward),
@@ -381,6 +446,16 @@ def _noop_failure(
     }
 
 
+def _require_action_interface(env: MarketCanvasEnv, expected: ActionInterface) -> None:
+    """Validate that the session was initialized with the expected action interface."""
+
+    if env.action_interface != expected:
+        raise RuntimeError(
+            f"This tool requires action_interface='{expected}'. "
+            f"Current session uses '{env.action_interface}'. Re-run initialize_env accordingly."
+        )
+
+
 @mcp.tool
 def initialize_env(
     canvas_width: int = 800,
@@ -389,6 +464,7 @@ def initialize_env(
     max_elements: int = 20,
     seed: int | None = None,
     observation_mode: ObservationMode = OBSERVATION_MODE_SEMANTIC,
+    action_interface: ActionInterface = ACTION_INTERFACE_SEMANTIC,
 ) -> dict[str, Any]:
     """Initialize a new MarketCanvas environment session."""
 
@@ -402,6 +478,11 @@ def initialize_env(
                 f"Unsupported observation_mode '{observation_mode}'. "
                 f"Expected one of {OBSERVATION_MODES}."
             )
+        if action_interface not in ACTION_INTERFACES:
+            raise ValueError(
+                f"Unsupported action_interface '{action_interface}'. "
+                f"Expected one of {ACTION_INTERFACES}."
+            )
 
         if SESSION.env is not None:
             SESSION.env.close()
@@ -412,6 +493,7 @@ def initialize_env(
             max_steps=max_steps,
             max_elements=max_elements,
             observation_mode=observation_mode,
+            action_interface=action_interface,
         )
         _, info = env.reset(seed=seed)
         SESSION.env = env
@@ -423,6 +505,7 @@ def initialize_env(
             "session_id": SESSION.session_id,
             "prompt": info["prompt"],
             "prompt_id": env._current_prompt_id,
+            "action_interface": env.action_interface,
             "observation_mode": env.observation_mode,
             "observation": _observation_payload(env),
             "canvas_state": _semantic_state(env),
@@ -464,19 +547,28 @@ def execute_action(
 
     with SESSION.lock:
         env = _require_env(session_id)
+        if env.action_interface == ACTION_INTERFACE_LOW_LEVEL and action_type != "done":
+            raise RuntimeError(
+                "Semantic mutation actions are disabled for low_level sessions. "
+                "Use set_active_tool/mouse_move/mouse_click/mouse_drag/keyboard_type instead."
+            )
 
         try:
-            action = _make_action(
-                env,
-                action_type=action_type,
-                element_id=element_id,
-                x=x,
-                y=y,
-                width=width,
-                height=height,
-                color=color,
-                content=content,
-            )
+            if env.action_interface == ACTION_INTERFACE_LOW_LEVEL:
+                action = _base_low_level_action()
+                action["action_type"] = LOW_LEVEL_ACTION_DONE
+            else:
+                action = _make_action(
+                    env,
+                    action_type=action_type,
+                    element_id=element_id,
+                    x=x,
+                    y=y,
+                    width=width,
+                    height=height,
+                    color=color,
+                    content=content,
+                )
         except LookupError:
             return _noop_failure(env, action_type, element_id=element_id)
 
@@ -492,26 +584,13 @@ def execute_action(
                 color=color,
                 content=content,
             )
-
-        current_reward, current_breakdown = env.compute_reward()
-        reward_breakdown: dict[str, Any] = {}
-        reward = float(step_reward)
-        if terminated or truncated:
-            reward = float(current_reward)
-            reward_breakdown = current_breakdown
-
-        return {
-            "observation_mode": env.observation_mode,
-            "observation": _observation_payload(env),
-            "canvas_state": _semantic_state(env),
-            "reward": reward,
-            "current_reward": float(current_reward),
-            "terminated": terminated,
-            "truncated": truncated,
-            "reward_breakdown": reward_breakdown,
-            "current_reward_breakdown": current_breakdown,
-            "action_result": action_result,
-        }
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
 
 
 @mcp.tool
@@ -530,6 +609,7 @@ def get_current_reward(session_id: str) -> dict[str, Any]:
             "prompt": prompt.text if prompt is not None else "",
             "prompt_id": env._current_prompt_id,
             "session_id": SESSION.session_id,
+            "action_interface": env.action_interface,
         }
 
 
@@ -547,7 +627,111 @@ def save_canvas(session_id: str, filepath: str = "canvas_output.png") -> dict[st
             "path": str(path.resolve()),
             "element_count": env._canvas.element_count,
             "session_id": SESSION.session_id,
+            "action_interface": env.action_interface,
         }
+
+
+@mcp.tool
+def set_active_tool(session_id: str, tool: LowLevelToolName) -> dict[str, Any]:
+    """Set the active low-level insertion/selection tool."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        _require_action_interface(env, ACTION_INTERFACE_LOW_LEVEL)
+        action = _base_low_level_action()
+        action["action_type"] = LOW_LEVEL_ACTION_SET_TOOL
+        action["tool"] = tool_name_to_code(tool)
+        _, step_reward, terminated, truncated, info = env.step(action)
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
+
+
+@mcp.tool
+def mouse_move(session_id: str, x: int, y: int) -> dict[str, Any]:
+    """Move the low-level cursor to a canvas position."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        _require_action_interface(env, ACTION_INTERFACE_LOW_LEVEL)
+        action = _base_low_level_action()
+        action["action_type"] = LOW_LEVEL_ACTION_MOUSE_MOVE
+        action["x"] = int(x)
+        action["y"] = int(y)
+        _, step_reward, terminated, truncated, info = env.step(action)
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
+
+
+@mcp.tool
+def mouse_click(session_id: str) -> dict[str, Any]:
+    """Click at the current low-level cursor position."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        _require_action_interface(env, ACTION_INTERFACE_LOW_LEVEL)
+        action = _base_low_level_action()
+        action["action_type"] = LOW_LEVEL_ACTION_MOUSE_CLICK
+        _, step_reward, terminated, truncated, info = env.step(action)
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
+
+
+@mcp.tool
+def mouse_drag(session_id: str, x1: int, y1: int, x2: int, y2: int) -> dict[str, Any]:
+    """Perform a complete low-level drag gesture."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        _require_action_interface(env, ACTION_INTERFACE_LOW_LEVEL)
+        action = _base_low_level_action()
+        action["action_type"] = LOW_LEVEL_ACTION_MOUSE_DRAG
+        action["x"] = int(x1)
+        action["y"] = int(y1)
+        action["x2"] = int(x2)
+        action["y2"] = int(y2)
+        _, step_reward, terminated, truncated, info = env.step(action)
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
+
+
+@mcp.tool
+def keyboard_type(session_id: str, text: str) -> dict[str, Any]:
+    """Type into the currently focused low-level text-capable element."""
+
+    with SESSION.lock:
+        env = _require_env(session_id)
+        _require_action_interface(env, ACTION_INTERFACE_LOW_LEVEL)
+        action = _base_low_level_action()
+        action["action_type"] = LOW_LEVEL_ACTION_KEYBOARD_TYPE
+        action["text"] = text
+        _, step_reward, terminated, truncated, info = env.step(action)
+        return _step_payload(
+            env,
+            step_reward=step_reward,
+            terminated=terminated,
+            truncated=truncated,
+            info=info,
+        )
 
 
 @mcp.resource("canvas://state")

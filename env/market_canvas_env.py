@@ -29,6 +29,9 @@ from rewards.accessibility import relative_luminance
 from rewards.calculator import RewardCalculator
 from rewards.prompts import PromptBank, TargetPrompt
 
+# Minimum element dimension to count as substantive (anti reward-hacking)
+_MIN_ELEMENT_SIZE = 20
+
 
 class MarketCanvasEnv(gymnasium.Env):
     """MarketCanvas-Env: a minimalist 2D design canvas RL environment."""
@@ -66,10 +69,15 @@ class MarketCanvasEnv(gymnasium.Env):
         self._reward_calc = RewardCalculator(weights=reward_weights)
         self._prompt_bank = PromptBank()
 
-        self.observation_space = build_observation_space(max_elements)
-        self.action_space = build_action_space(max_elements)
+        self.observation_space = build_observation_space(
+            max_elements, num_prompts=len(self._prompt_bank.PROMPTS)
+        )
+        self.action_space = build_action_space(
+            max_elements, canvas_width=canvas_width, canvas_height=canvas_height
+        )
 
         self._current_prompt: TargetPrompt | None = None
+        self._current_prompt_id: int = 0
         self._step_count = 0
 
     def reset(
@@ -80,11 +88,11 @@ class MarketCanvasEnv(gymnasium.Env):
         """Start a new episode."""
 
         super().reset(seed=seed)
-        del options
+        options = options or {}
 
         self._canvas.clear()
         self._step_count = 0
-        self._current_prompt = self._prompt_bank.sample(self.np_random)
+        self._current_prompt_id, self._current_prompt = self._resolve_prompt(options)
 
         return self._get_obs(), self._get_info()
 
@@ -128,6 +136,7 @@ class MarketCanvasEnv(gymnasium.Env):
         state["target_prompt"] = self._current_prompt.text if self._current_prompt else ""
         state["step_count"] = self._step_count
         state["max_steps"] = self.max_steps
+        state["spatial_relationships"] = self._build_spatial_relationships()
         return state
 
     def compute_reward(self) -> tuple[float, dict[str, Any]]:
@@ -173,8 +182,8 @@ class MarketCanvasEnv(gymnasium.Env):
 
         x = int(action["x"])
         y = int(action["y"])
-        width = max(1, int(action["width"]))
-        height = max(1, int(action["height"]))
+        width = max(_MIN_ELEMENT_SIZE, int(action["width"]))
+        height = max(_MIN_ELEMENT_SIZE, int(action["height"]))
         color_idx = int(action["color_idx"]) % len(COLOR_PALETTE)
         content_idx = int(action["content_idx"]) % len(CONTENT_TEMPLATES)
         color = COLOR_PALETTE[color_idx]
@@ -214,14 +223,22 @@ class MarketCanvasEnv(gymnasium.Env):
         return {"action": "move", "success": success, "element_id": element_id}
 
     def _action_recolor(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Change an element's color."""
+        """Change an element's color. For shapes with content, also updates text_color."""
 
         element_id = self._idx_to_element_id(int(action["element_idx"]))
         if element_id is None:
             return {"action": "recolor", "success": False}
 
         color_idx = int(action["color_idx"]) % len(COLOR_PALETTE)
-        success = self._canvas.update_element(element_id, color=COLOR_PALETTE[color_idx])
+        new_color = COLOR_PALETTE[color_idx]
+        updates: dict[str, Any] = {"color": new_color}
+
+        element = self._canvas.get_element(element_id)
+        if element is not None and element.type == ElementType.SHAPE and element.content:
+            luminance = relative_luminance(new_color)
+            updates["text_color"] = "#000000" if luminance > 0.179 else "#FFFFFF"
+
+        success = self._canvas.update_element(element_id, **updates)
         return {"action": "recolor", "success": success, "element_id": element_id}
 
     def _action_remove(self, action: dict[str, Any]) -> dict[str, Any]:
@@ -280,13 +297,14 @@ class MarketCanvasEnv(gymnasium.Env):
             mask[index] = 1
 
         step_fraction = np.array(
-            [self._step_count / self.max_steps if self.max_steps > 0 else 0.0],
+            [min(1.0, self._step_count / self.max_steps) if self.max_steps > 0 else 0.0],
             dtype=np.float32,
         )
         return {
             "elements": features,
             "element_mask": mask,
             "step_fraction": step_fraction,
+            "prompt_id": np.int64(self._current_prompt_id),
         }
 
     def _get_info(self, terminal: bool = False) -> dict[str, Any]:
@@ -300,6 +318,68 @@ class MarketCanvasEnv(gymnasium.Env):
         if terminal:
             info["semantic_state"] = self.get_semantic_state()
         return info
+
+    def _resolve_prompt(self, options: dict[str, Any]) -> tuple[int, TargetPrompt]:
+        """Resolve the episode prompt from reset options or RNG sampling."""
+
+        prompt_id = options.get("prompt_id")
+        prompt_text = options.get("prompt_text")
+
+        if prompt_id is not None and prompt_text is not None:
+            raise ValueError("Provide at most one of prompt_id or prompt_text in reset options.")
+
+        prompts = self._prompt_bank.PROMPTS
+
+        if prompt_id is not None:
+            prompt_idx = int(prompt_id)
+            if not 0 <= prompt_idx < len(prompts):
+                raise ValueError(f"prompt_id must be in [0, {len(prompts) - 1}]")
+            return prompt_idx, prompts[prompt_idx]
+
+        if prompt_text is not None:
+            for idx, prompt in enumerate(prompts):
+                if prompt.text == prompt_text:
+                    return idx, prompt
+            raise ValueError("prompt_text must match one of PromptBank.PROMPTS exactly.")
+
+        prompt_idx = int(self.np_random.integers(0, len(prompts)))
+        return prompt_idx, prompts[prompt_idx]
+
+    def _build_spatial_relationships(self) -> list[dict[str, Any]]:
+        """Build explicit pairwise spatial relationships for semantic-state consumers."""
+
+        elements = self._canvas.get_all_elements()
+        relationships: list[dict[str, Any]] = []
+
+        for i, element_a in enumerate(elements):
+            ax1, ay1, ax2, ay2 = element_a.bounds
+            acx, acy = element_a.center
+            for element_b in elements[i + 1 :]:
+                bx1, by1, bx2, by2 = element_b.bounds
+                bcx, bcy = element_b.center
+
+                overlap_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+                overlap_y = max(0, min(ay2, by2) - max(ay1, by1))
+                overlap_area = int(overlap_x * overlap_y)
+
+                relationships.append(
+                    {
+                        "element_a": element_a.id,
+                        "element_b": element_b.id,
+                        "a_left_of_b": ax2 <= bx1,
+                        "a_right_of_b": ax1 >= bx2,
+                        "a_above_b": ay2 <= by1,
+                        "a_below_b": ay1 >= by2,
+                        "overlaps": overlap_area > 0,
+                        "overlap_area": overlap_area,
+                        "a_contains_b": ax1 <= bx1 and ay1 <= by1 and ax2 >= bx2 and ay2 >= by2,
+                        "b_contains_a": bx1 <= ax1 and by1 <= ay1 and bx2 >= ax2 and by2 >= ay2,
+                        "center_dx": float(bcx - acx),
+                        "center_dy": float(bcy - acy),
+                    }
+                )
+
+        return relationships
 
     def _idx_to_element_id(self, idx: int) -> str | None:
         """Convert an action's element_idx to an actual element ID."""

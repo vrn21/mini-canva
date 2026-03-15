@@ -26,10 +26,6 @@ class DenseRewardWrapper(gymnasium.Wrapper):
     ) -> tuple[dict, float, bool, bool, dict]:
         obs, reward, terminated, truncated, info = self.env.step(action)
 
-        if terminated or truncated:
-            self._last_reward = reward
-            return obs, reward, terminated, truncated, info
-
         current_reward, breakdown = self.unwrapped.compute_reward()
         delta = current_reward - self._last_reward
         self._last_reward = current_reward

@@ -123,7 +123,7 @@ class TestAccessibility:
             height=50,
             text_color="#808080",
             content="Large",
-            font_size=18,
+            font_size=24,
         )
         canvas.add_element(
             ElementType.TEXT,

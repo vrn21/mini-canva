@@ -59,7 +59,7 @@ CONTENT_TEMPLATES: tuple[str, ...] = (
 )
 
 
-def build_observation_space(max_elements: int) -> spaces.Dict:
+def build_observation_space(max_elements: int, num_prompts: int) -> spaces.Dict:
     """Build the Gymnasium observation space."""
 
     return spaces.Dict(
@@ -72,21 +72,24 @@ def build_observation_space(max_elements: int) -> spaces.Dict:
             ),
             "element_mask": spaces.MultiBinary(max_elements),
             "step_fraction": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "prompt_id": spaces.Discrete(num_prompts),
         }
     )
 
 
-def build_action_space(max_elements: int) -> spaces.Dict:
+def build_action_space(
+    max_elements: int, canvas_width: int = 800, canvas_height: int = 600
+) -> spaces.Dict:
     """Build the Gymnasium action space."""
 
     return spaces.Dict(
         {
             "action_type": spaces.Discrete(NUM_ACTION_TYPES),
             "element_idx": spaces.Discrete(max_elements),
-            "x": spaces.Discrete(800),
-            "y": spaces.Discrete(600),
-            "width": spaces.Discrete(800),
-            "height": spaces.Discrete(600),
+            "x": spaces.Discrete(canvas_width),
+            "y": spaces.Discrete(canvas_height),
+            "width": spaces.Discrete(canvas_width),
+            "height": spaces.Discrete(canvas_height),
             "color_idx": spaces.Discrete(len(COLOR_PALETTE)),
             "content_idx": spaces.Discrete(len(CONTENT_TEMPLATES)),
         }

@@ -4,6 +4,7 @@ import gymnasium
 import numpy as np
 
 from env.market_canvas_env import MarketCanvasEnv
+from engine.types import ElementType
 from env.spaces import (
     ACTION_ADD_SHAPE,
     ACTION_ADD_TEXT,
@@ -72,6 +73,21 @@ class TestEnvReset:
         env = MarketCanvasEnv()
         obs, _ = env.reset(seed=42)
         assert env.observation_space.contains(obs)
+        env.close()
+
+    def test_reset_accepts_prompt_text_option(self):
+        env = MarketCanvasEnv()
+        obs, info = env.reset(
+            seed=42,
+            options={
+                "prompt_text": (
+                    "Create a Summer Sale email banner with a headline, "
+                    "a yellow CTA button, and good contrast"
+                )
+            },
+        )
+        assert info["prompt"].startswith("Create a Summer Sale")
+        assert int(obs["prompt_id"]) == 0
         env.close()
 
 
@@ -220,6 +236,22 @@ class TestSemanticState:
         assert "target_prompt" in state
         assert "step_count" in state
         assert "max_steps" in state
+        assert "spatial_relationships" in state
+        env.close()
+
+    def test_semantic_state_includes_spatial_relationships(self):
+        env = MarketCanvasEnv()
+        env.reset(seed=42)
+        env._canvas.add_element(ElementType.TEXT, x=50, y=50, width=100, height=40, content="A")
+        env._canvas.add_element(ElementType.SHAPE, x=200, y=50, width=120, height=60, content="B")
+        state = env.get_semantic_state()
+        relationships = state["spatial_relationships"]
+        assert len(relationships) == 1
+        relationship = relationships[0]
+        assert relationship["element_a"] == "element_0"
+        assert relationship["element_b"] == "element_1"
+        assert relationship["a_left_of_b"] is True
+        assert relationship["overlaps"] is False
         env.close()
 
 

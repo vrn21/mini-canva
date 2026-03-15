@@ -5,6 +5,8 @@ from __future__ import annotations
 from engine.canvas import Canvas
 from engine.types import Element, ElementType
 
+_LARGE_TEXT_MIN_PX = 24
+
 
 class AccessibilityChecker:
     """Checks WCAG 2.1 AA contrast compliance for text elements."""
@@ -28,7 +30,9 @@ class AccessibilityChecker:
 
         bg_color = self._get_effective_background(element, canvas)
         ratio = contrast_ratio(element.text_color, bg_color)
-        threshold = 3.0 if element.font_size >= 18 else 4.5
+        # WCAG's relaxed threshold applies to large text (roughly 18pt regular),
+        # which maps more closely to ~24 CSS px than 18 px.
+        threshold = 3.0 if element.font_size >= _LARGE_TEXT_MIN_PX else 4.5
         return ratio >= threshold
 
     def _get_effective_background(self, element: Element, canvas: Canvas) -> str:
